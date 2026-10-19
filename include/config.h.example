@@ -1,0 +1,7 @@
+#pragma once
+
+// Скопируйте этот файл в include/config.h и укажите ваши реальные данные:
+//
+// const char* WIFI_SSID     = "MyHomeWiFi";
+// const char* WIFI_PASSWORD = "MyPassword";
+// const char* GEMINI_API_KEY = "AIzaSy...";

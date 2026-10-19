@@ -1,11 +1,13 @@
 /**
- * ESP32-S3 Standalone Gemini Voice Assistant (Direct HTTPS, NO PC / Bridge)
+ * ESP32-S3 Standalone Gemini Voice Assistant
+ * Полностью автономная работа: прямое общение с Google Gemini Cloud (HTTPS).
  * 
- * Напрямую общается с Google Gemini 2.0 Flash REST API по HTTPS:
- * 1. Записывает аудио с микрофона INMP441 в WAV-буфер.
- * 2. Кодирует WAV в Base64.
- * 3. Отправляет JSON POST с inlineData: audio/wav и generationConfig: responseModalities: ["AUDIO"].
- * 4. Получает аудио-ответ модели и проигрывает его через ЦАП PCM5102.
+ * Пайплайн обработки:
+ * 1. Запись 4 сек звука с I2S микрофона INMP441 в буфер PSRAM (WAV 16kHz Mono).
+ * 2. Base64 кодирование аудио.
+ * 3. Отправка в gemini-3.5-flash (понимание речи + генерация краткого ответа).
+ * 4. Запрос синтеза речи в gemini-3.8-flash-tts -> получение аудиопотока WAV.
+ * 5. Декодирование и прямое воспроизведение через ЦАП PCM5102.
  */
 
 #include <Arduino.h>
@@ -16,15 +18,17 @@
 #include <driver/i2s.h>
 #include <mbedtls/base64.h>
 
-// ================= НАСТРОЙКИ СЕТИ И GEMINI =================
+#if __has_include("config.h")
+#include "config.h"
+#else
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-
-// Бесплатный ключ из Google AI Studio (https://aistudio.google.com/)
 const char* GEMINI_API_KEY = "YOUR_GEMINI_API_KEY";
+#endif
 
-// Модель Gemini с поддержкой аудио ввода и вывода
-const char* GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+// Эндпоинты моделей Google
+const char* LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+const char* TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-tts:generateContent";
 
 // ================= ПИНЫ I2S =================
 // ЦАП PCM5102 (Вывод аудио)
@@ -65,9 +69,9 @@ void createWavHeader(uint8_t* header, int totalDataLen) {
     header[7] = (uint8_t)((totalFileLen >> 24) & 0xff);
     header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
     header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
-    header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0; // Subchunk1Size (16 for PCM)
-    header[20] = 1; header[21] = 0; // AudioFormat (1 for PCM)
-    header[22] = 1; header[23] = 0; // NumChannels (1 = Mono)
+    header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+    header[20] = 1; header[21] = 0; // PCM
+    header[22] = 1; header[23] = 0; // Mono
     header[24] = (uint8_t)(sampleRate & 0xff);
     header[25] = (uint8_t)((sampleRate >> 8) & 0xff);
     header[26] = (uint8_t)((sampleRate >> 16) & 0xff);
@@ -76,7 +80,7 @@ void createWavHeader(uint8_t* header, int totalDataLen) {
     header[29] = (uint8_t)((byteRate >> 8) & 0xff);
     header[30] = (uint8_t)((byteRate >> 16) & 0xff);
     header[31] = (uint8_t)((byteRate >> 24) & 0xff);
-    header[32] = 2; header[33] = 0; // BlockAlign (channels * bits / 8)
+    header[32] = 2; header[33] = 0; // BlockAlign
     header[34] = 16; header[35] = 0; // BitsPerSample
     header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
     header[40] = (uint8_t)(totalDataLen & 0xff);
@@ -137,7 +141,12 @@ void initI2S() {
 
 void playPCM(const uint8_t* data, size_t length) {
     size_t written = 0;
-    i2s_write(I2S_DAC_PORT, data, length, &written, portMAX_DELAY);
+    // Если аудио содержит 44-байтный WAV заголовок, пропускаем его для воспроизведения чистого PCM
+    size_t offset = 0;
+    if (length > 44 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F') {
+        offset = 44;
+    }
+    i2s_write(I2S_DAC_PORT, data + offset, length - offset, &written, portMAX_DELAY);
 }
 
 void recordAudio() {
@@ -157,84 +166,121 @@ void recordAudio() {
         totalRead += bytesRead;
     }
 
-    Serial.println("[MIC] Запись завершена. Отправка в Gemini Cloud...");
+    Serial.println("[MIC] Запись завершена. Отправка в Gemini...");
 }
 
-void sendToGemini() {
+// Запрос синтеза речи TTS по полученному тексту
+void requestTTS(const String& textToSpeak) {
+    Serial.printf("[TTS] Запрос синтеза речи: \"%s\"\n", textToSpeak.c_str());
+
+    String url = String(TTS_URL) + "?key=" + GEMINI_API_KEY;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient https;
+    if (https.begin(client, url)) {
+        https.addHeader("Content-Type", "application/json");
+
+        DynamicJsonDocument reqDoc(1024);
+        JsonObject part = reqDoc["contents"][0]["parts"].createNestedObject();
+        part["text"] = textToSpeak;
+        reqDoc["generationConfig"]["responseModalities"][0] = "AUDIO";
+
+        String jsonPayload;
+        serializeJson(reqDoc, jsonPayload);
+
+        int httpCode = https.POST(jsonPayload);
+        if (httpCode == HTTP_CODE_OK) {
+            String respStr = https.getString();
+            DynamicJsonDocument respDoc(65536);
+            DeserializationError err = deserializeJson(respDoc, respStr);
+
+            if (!err) {
+                const char* b64Audio = respDoc["candidates"][0]["content"]["parts"][0]["inlineData"]["data"];
+                if (b64Audio) {
+                    size_t rawLen = strlen(b64Audio);
+                    size_t outLen = 0;
+                    uint8_t* audioBytes = (uint8_t*)ps_malloc(rawLen);
+
+                    if (audioBytes && mbedtls_base64_decode(audioBytes, rawLen, &outLen, (const uint8_t*)b64Audio, rawLen) == 0) {
+                        Serial.printf("[TTS] Воспроизведение звука (%d байт)...\n", outLen);
+                        playPCM(audioBytes, outLen);
+                        free(audioBytes);
+                    } else {
+                        Serial.println("[ERROR] Ошибка декодирования Base64 в TTS!");
+                    }
+                }
+            } else {
+                Serial.printf("[ERROR] Ошибка десериализации JSON TTS: %s\n", err.c_str());
+            }
+        } else {
+            Serial.printf("[ERROR] Ошибка HTTP TTS: %d\n", httpCode);
+            Serial.println(https.getString());
+        }
+        https.end();
+    }
+}
+
+// Отправка записанного голоса в LLM gemini-3.5-flash
+void processVoiceInteraction() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[WiFi] Нет подключения к сети!");
         return;
     }
 
-    // 1. Кодируем WAV в Base64
+    // 1. Кодируем записанный WAV в Base64
     size_t b64Len = 0;
     mbedtls_base64_encode(NULL, 0, &b64Len, wavBuffer, TOTAL_WAV_SIZE);
 
     char* b64Audio = (char*)ps_malloc(b64Len + 1);
     if (!b64Audio) {
-        Serial.println("[ERROR] Недостаточно PSRAM для Base64 буфера!");
+        Serial.println("[ERROR] Недостаточно памяти PSRAM для Base64 буфера!");
         return;
     }
 
     mbedtls_base64_encode((uint8_t*)b64Audio, b64Len + 1, &b64Len, wavBuffer, TOTAL_WAV_SIZE);
     b64Audio[b64Len] = '\0';
 
-    // 2. Формируем URL с ключом
-    String url = String(GEMINI_URL) + "?key=" + GEMINI_API_KEY;
+    String url = String(LLM_URL) + "?key=" + GEMINI_API_KEY;
 
     WiFiClientSecure client;
-    client.setInsecure(); // Для простоты без корневого CA сертификата
+    client.setInsecure();
 
     HTTPClient https;
     if (https.begin(client, url)) {
         https.addHeader("Content-Type", "application/json");
 
-        // Формируем тело JSON
-        // Используем String / stream для экономии оперативной памяти
         String jsonPayload = "{\"contents\":[{\"parts\":[";
-        jsonPayload += "{\"text\":\"Ты голосовой ассистент Юи. Отвечай кратко на русском языке голосом.\"},";
+        jsonPayload += "{\"text\":\"Ты голосовой ассистент Юи. Отвечай кратко, дружелюбно, одним или двумя предложениями по-русски.\"},";
         jsonPayload += "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"";
         jsonPayload += b64Audio;
-        jsonPayload += "\"}}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]}}";
+        jsonPayload += "\"}}]}],\"generationConfig\":{\"maxOutputTokens\":120}}";
 
-        // Освобождаем b64 буфер сразу после упаковки в payload
-        free(b64Audio);
+        free(b64Audio); // Освобождаем память PSRAM
 
-        Serial.println("[Gemini] Отправка HTTPS POST запроса...");
+        Serial.println("[Gemini] Отправка голоса в gemini-3.5-flash...");
         int httpCode = https.POST(jsonPayload);
 
         if (httpCode == HTTP_CODE_OK) {
-            Serial.println("[Gemini] Ответ получен! Парсинг аудио...");
-            String responseStr = https.getString();
-
-            // Парсим ответ JSON
-            DynamicJsonDocument doc(32768);
-            DeserializationError err = deserializeJson(doc, responseStr);
+            String respStr = https.getString();
+            DynamicJsonDocument doc(16384);
+            DeserializationError err = deserializeJson(doc, respStr);
 
             if (!err) {
-                const char* b64RespAudio = doc["candidates"][0]["content"]["parts"][0]["inlineData"]["data"];
-                if (b64RespAudio) {
-                    size_t outLen = 0;
-                    size_t rawRespLen = strlen(b64RespAudio);
-                    uint8_t* decodedAudio = (uint8_t*)ps_malloc(rawRespLen);
-
-                    if (decodedAudio && mbedtls_base64_decode(decodedAudio, rawRespLen, &outLen, (const uint8_t*)b64RespAudio, rawRespLen) == 0) {
-                        Serial.printf("[Gemini] Воспроизведение ответа (%d байт)...\n", outLen);
-                        playPCM(decodedAudio, outLen);
-                        free(decodedAudio);
-                    } else {
-                        Serial.println("[ERROR] Ошибка декодирования Base64 аудио ответа!");
-                    }
+                const char* answerText = doc["candidates"][0]["content"]["parts"][0]["text"];
+                if (answerText) {
+                    Serial.printf("[Gemini Ответ]: %s\n", answerText);
+                    // Озвучиваем ответ через Gemini TTS
+                    requestTTS(String(answerText));
                 } else {
-                    Serial.println("[Gemini] В ответе нет поля inlineData (возможно текстовый ответ)");
-                    const char* textResp = doc["candidates"][0]["content"]["parts"][0]["text"];
-                    if (textResp) Serial.println(textResp);
+                    Serial.println("[Gemini] Текст в ответе отсутствует");
                 }
             } else {
                 Serial.printf("[ERROR] Ошибка десериализации JSON: %s\n", err.c_str());
             }
         } else {
-            Serial.printf("[ERROR] HTTP Код ошибки: %d\n", httpCode);
+            Serial.printf("[ERROR] Ошибка HTTP от Gemini: %d\n", httpCode);
             Serial.println(https.getString());
         }
 
@@ -271,19 +317,19 @@ void setup() {
         Serial.print(".");
     }
     Serial.println("\n[WiFi] Подключено! IP: " + WiFi.localIP().toString());
-    Serial.println("Система готова. Ожидание голоса...");
+    Serial.println("Система готова к диалогу. Скажите что-нибудь в микрофон...");
 }
 
 void loop() {
-    // Детекция активности голоса (VAD)
+    // Мониторим уровень шума / голоса с микрофона INMP441
     int16_t sample = 0;
     size_t bytesRead = 0;
     i2s_read(I2S_MIC_PORT, &sample, sizeof(int16_t), &bytesRead, 10);
 
     if (abs(sample) > VAD_THRESHOLD) {
-        Serial.printf("[VAD] Обнаружен звук (амплитуда=%d). Начинаем запись...\n", abs(sample));
+        Serial.printf("[VAD] Голос обнаружен (амплитуда=%d)!\n", abs(sample));
         recordAudio();
-        sendToGemini();
+        processVoiceInteraction();
         Serial.println("\nГотов к следующему вопросу...");
     }
 

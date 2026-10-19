@@ -6,3 +6,4 @@
 *.a
 .DS_Store
 wifi_config.json
+include/config.h
