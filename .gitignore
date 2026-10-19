@@ -1,0 +1,8 @@
+.pio/
+.vscode/
+*.bin
+*.elf
+*.o
+*.a
+.DS_Store
+wifi_config.json
